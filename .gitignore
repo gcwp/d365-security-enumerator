@@ -1,0 +1,10 @@
+output.json
+output-*.json
+d365_enum.json
+d365_enum_*.json
+results/
+reports/
+__pycache__/
+*.pyc
+.venv/
+venv/
