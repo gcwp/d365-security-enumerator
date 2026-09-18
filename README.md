@@ -1,7 +1,7 @@
 # D365 Security Enumerator
 
-A read-only Dynamics 365 Customer Engagement / Dataverse Web API enumeration
-tool for authorized security assessments. It authenticates through an
+A Dynamics 365 Customer Engagement / Dataverse Web API enumeration and
+controlled-validation tool for authorized security assessments. It authenticates through an
 interactive Chromium session, reuses the resulting CRM cookies, writes a JSON
 assessment artifact, and can open a local dashboard for review.
 
@@ -18,13 +18,14 @@ assessment artifact, and can open a local dashboard for review.
 - Effective user privileges with Global, Deep, Local, and Basic depth.
 - Separate access views for default entities and custom entities.
 - Passive read probes: data visible, no visible data, access denied, and errors.
-- Optional record counts limited to records visible to the authenticated user.
+- Automatic visible-record counts for every addressable entity using the entity-set `/$count` endpoint, with a `$count=true` collection fallback for incompatible entity sets.
 - Metadata-driven secrets and configuration scanning.
 - Masked findings with SHA-256 fingerprints and record-specific verification URLs.
-- Localhost-only dashboard with tabs, search, filters, and expandable JSON.
+- Localhost-only dashboard with tabs, search, filters, entity metadata links, Excel export, and expandable JSON.
+- Likely custom plug-in assembly inventory with targeted DLL download and strings extraction.
+- Controlled `If-Match` PATCH tester available on every enumerated entity, using a server ETag when available and `If-Match: *` as an update-only fallback when Dynamics omits the ETag.
 
-The enumerator uses HTTP `GET` requests for collection and verification. It does
-not create, modify, assign, share, or delete Dynamics records.
+Normal enumeration and export use HTTP `GET` requests only. The dashboard also contains an explicit, controlled PATCH tester for authorized, reversible validation. The tester is available on every enumerated entity with a metadata ID; mapped `Write` privilege is shown as context but is not used as a gate, so the live Dynamics response is the authorization result.
 
 ## Requirements
 
@@ -44,6 +45,9 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 playwright install chromium
 ```
+
+Keep `d365_enum.py` and `d365_dashboard.py` in the same directory when using
+the integrated dashboard.
 
 ## Basic usage
 
@@ -86,9 +90,6 @@ python d365_enum.py https://crm.example.test/Organization \
 
 # Verify TLS certificates in Chromium and API requests
 python d365_enum.py https://crm.example.test/Organization --verify
-
-# Add visible-record counts; this sends an additional count request per entity
-python d365_enum.py https://crm.example.test/Organization --entity-counts
 
 # Use another dashboard port
 python d365_enum.py https://crm.example.test/Organization \
@@ -143,6 +144,69 @@ python d365_enum.py https://crm.example.test/Organization \
 amounts of application data. Use it only when the assessment scope and data
 handling rules permit it.
 
+## Plug-in assembly inventory
+
+When the authenticated user can read the standard `pluginassembly` table, the
+enumerator lists likely customized/non-Microsoft assemblies using this heuristic:
+
+```text
+customizationlevel gt 0
+and publickeytoken ne '31bf3856ad364e35'
+and not contains(name, 'Microsoft.')
+```
+
+The result JSON stores metadata only, including the assembly ID, name, version,
+source type, isolation mode, public key token, modification details, and API
+verification links. The Base64 `content` value is never requested during normal
+enumeration and is never added to `d365_enum.json`.
+
+Launch the dashboard directly from an authenticated enumeration run to enable
+live actions:
+
+```bash
+python d365_enum.py https://crm.example.test/Organization --dashboard
+```
+
+The **Plug-in assemblies** tab then provides, one assembly at a time:
+
+- **Download DLL**: retrieves `content`, decodes Base64 in memory, and sends the
+  selected DLL to the browser without persisting it in the dashboard or JSON.
+- **Relevant strings**: extracts ASCII and UTF-16LE strings and returns strings
+  matching security-relevant concepts such as URLs, API routes, credentials,
+  tokens, connection strings, SharePoint, Elasticsearch, Tika, and SQL.
+- **All strings**: returns up to 5,000 unique strings for the selected assembly.
+
+The strings panel opens directly below the selected assembly row. Opening strings
+for another assembly automatically closes the previously opened panel.
+
+There is deliberately no bulk-download action. The filter is heuristic:
+third-party assemblies may be included, and client assemblies using unusual
+names or signing arrangements may be missed.
+
+When an old result is opened with the standalone dashboard command, the
+inventory remains available but DLL and strings actions are disabled because
+no authenticated Dynamics session is retained:
+
+```bash
+python d365_dashboard.py --input d365_enum.json
+```
+
+Use a .NET decompiler such as ILSpy or dnSpyEx for full source-level review of a
+downloaded DLL. The integrated strings view is triage, not decompilation.
+
+## Dashboard entity export and metadata links
+
+The dashboard header contains one **Export entities** action. It downloads a single
+Excel workbook with all default and custom entities in one sheet. The export contains:
+
+```text
+Entity, Type, Access status, Create, Read, Write, Delete, Assign, Share, Append, AppendTo, Visible records, URL
+```
+
+Each entity row in the dashboard also includes a direct **Metadata** link. The
+**Readable organization settings** section has a search field covering the setting
+group, name, and value.
+
 ## Opening an existing result
 
 ```bash
@@ -165,8 +229,9 @@ directory as `d365_enum.py` when using the enumerator's `--dashboard` option.
 - **Readable with no visible data**: the collection request succeeded, but no row
   was returned. The table may be empty or record-level security may filter it.
 - **Access denied**: the collection request was rejected for the current user.
-- **Visible record count**: records visible to the current user, not necessarily
-  the total rows stored in the environment.
+- **Visible record count**: the integer returned by `/<entity-set>/$count`, or by the collection `@odata.count` fallback, for the authenticated user. A value of `0` can mean the entity is empty or that record-level security filters all rows.
+- **Entity metadata link**: opens `EntityDefinitions(LogicalName='<entity>')` for the selected entity.
+- **Export entities**: downloads one Excel workbook containing all default and custom entities, access state, detected privilege depths, visible-record count, and API URL.
 - **Checks not evaluated**: the expected setting was not available in the
   readable `organizations` columns or parsed `OrgDbOrgSettings` data. This is an
   unknown result, not confirmation that the setting is secure.
@@ -214,8 +279,11 @@ and API requests enforce certificate validation.
 - A denied or empty collection does not prove that another action, function,
   relationship, plug-in, workflow, or application endpoint cannot expose data.
 - Potential insecure-setting checks are assessment aids, not automatic findings.
+- Record-level sharing, access-team grants, hierarchy reach, ownership, and cascading access remain unknown when listed as not evaluated.
 - Verification links may expose sensitive data when opened and should be handled
   under the engagement's evidence and data-retention rules.
+- Plug-in DLLs and extracted strings may contain proprietary code, internal URLs,
+  credentials, or customer-specific logic and must be handled as assessment data.
 
 ## Repository safety
 
@@ -238,3 +306,32 @@ approved client channel, not in this repository's public issues.
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Controlled entity update tests
+
+When the dashboard is launched directly from the enumerator, **every enumerated entity with a metadata ID** shows a **Test update** action. The privilege inventory is deliberately advisory here: a mapped `Write` privilege is displayed for context, but the dashboard does not require it before allowing the test. This makes it possible to validate whether the server actually accepts or rejects an update even when privilege metadata is missing, inconsistent, or says `Write` is not held.
+
+The live Dynamics response is authoritative. A successful PATCH demonstrates that the selected record/attribute was updateable in the current authenticated context; a rejected PATCH remains useful authorization evidence. The tester does not automatically iterate records or fields.
+
+This is specifically useful for validating the privilege enumerator: if the inventory reports `Write = not held` but the server accepts the conditional PATCH, that discrepancy is evidence that the local privilege mapping needs review. Conversely, a rejected PATCH helps confirm that a reported non-held Write privilege is not a false positive.
+
+The workflow is intentionally manual and targeted:
+
+1. Select one entity and open **Test update**.
+2. Enter a dedicated test record GUID.
+3. Load supported writable attributes.
+4. Select a harmless, reversible attribute and load its current value.
+5. Confirm and submit the conditional PATCH.
+6. Restore the original value after validation.
+
+The updater asks Dynamics metadata for attributes where `IsValidForUpdate` is true and supports simple field types only. Lookups, owners, customers, party lists, files, images, virtual fields, and other complex attributes are excluded. The tool still requires a successful current-value read before PATCH. When Dynamics returns a record ETag, that exact ETag is used for optimistic concurrency. When Dynamics omits the ETag, the dashboard stores `*` and sends `If-Match: *`; this keeps the request update-only and prevents creation of a missing record through upsert behavior, but it does not protect against another writer changing the record between the read and PATCH.
+
+Some internal tables, such as `applicationfile`, support `RetrieveMultiple` but reject the keyed `Retrieve` message. When Dynamics returns that specific error, the dashboard automatically retries with a filtered collection query using the primary ID, captures the same record value and any returned ETag, and uses the same fallback for post-PATCH verification.
+
+The feature requires the live authenticated session created by:
+
+```bash
+python d365_enum.py https://host/OrgName --dashboard
+```
+
+The browser cookies stay in memory in the local dashboard process. They are not saved to `d365_enum.json` or another file. Reopening an existing JSON with `d365_dashboard.py` provides inventory-only mode and disables update actions.

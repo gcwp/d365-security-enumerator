@@ -1,10 +1,49 @@
+# Enumeration results and exported assessment data
 output.json
 output-*.json
 d365_enum.json
 d365_enum_*.json
+*.d365-enum.json
 results/
 reports/
+
+# Captured traffic and local browser/auth artifacts
+*.har
+browser-data/
+playwright/.auth/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
 venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Downloaded plug-in binaries and derived analysis
+*.dll
+*.strings.txt
+plugin-downloads/

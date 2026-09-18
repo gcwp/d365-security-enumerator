@@ -11,8 +11,9 @@ and quietly collects:
 * Direct and team-inherited security roles
 * Role privilege depths and privilege metadata with adaptive name resolution
 * A complete privilege inventory, ordered by depth with role/team source attribution
-* Custom entities plus a focused set of default entities, with endpoint URLs, held privilege matrices, and a lightweight read-access probe
+* All custom and default entities, with endpoint URLs, held privilege matrices, and a lightweight read-access probe
 * A masked secrets/configuration scan using attribute metadata, key/value store detection, structured JSON/XML inspection, and per-finding verification URLs
+* Likely custom plug-in assembly inventory without downloading assembly content during enumeration
 
 Setup:
     pip install requests playwright
@@ -36,16 +37,17 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 import requests
 import urllib3
 
 
+
 WHOAMI_FIELDS = ("UserId", "BusinessUnitId", "OrganizationId")
 API_VERSION_CANDIDATES = ("v9.2", "v9.1", "v9.0")
 ENTITY_PRIVILEGE_ORDER = ("Create", "Read", "Write", "Delete", "Assign", "Share", "Append", "AppendTo")
-PROJECT_VERSION = "0.1.0"
+PROJECT_VERSION = "1.0.0"
 
 SENSITIVE_STANDARD_ENTITY_LOGICAL_NAMES = (
     "organization",
@@ -2136,140 +2138,239 @@ def normalize_entity_definition(
     }
 
 
+def _probe_status_from_response(response: requests.Response) -> dict[str, Any]:
+    """Map a Dynamics collection/count response to the entity probe status model."""
+    result: dict[str, Any] = {
+        "http_status": response.status_code,
+        "content_type": response.headers.get("Content-Type", ""),
+    }
+    if response.status_code == 401:
+        result.update(status="AUTHENTICATION_FAILED", error=compact_error(response))
+    elif response.status_code == 403:
+        result.update(status="ACCESS_DENIED", error=compact_error(response))
+    elif response.status_code == 404:
+        result.update(status="NOT_ADDRESSABLE", error=compact_error(response))
+    elif response.status_code == 400:
+        result.update(status="INVALID_OR_UNSUPPORTED", error=compact_error(response))
+    elif response.status_code == 429:
+        result.update(
+            status="RATE_LIMITED",
+            error=compact_error(response),
+            retry_after=response.headers.get("Retry-After"),
+        )
+    elif 500 <= response.status_code <= 599:
+        result.update(status="BACKEND_ERROR", error=compact_error(response))
+    elif not response.ok:
+        result.update(status="INVALID_OR_UNSUPPORTED", error=compact_error(response))
+    return result
+
+
+def _parse_visible_count_response(response: requests.Response) -> int | None:
+    """Parse common scalar and JSON representations returned by OData $count endpoints."""
+
+    def normalize(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float) and value >= 0 and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            candidate = value.lstrip("\ufeff").strip().strip('"').strip("'").strip()
+            return int(candidate) if re.fullmatch(r"\d+", candidate) else None
+        if isinstance(value, dict):
+            for key in ("value", "@odata.count", "count", "d"):
+                if key in value:
+                    parsed = normalize(value.get(key))
+                    if parsed is not None:
+                        return parsed
+        if isinstance(value, list) and len(value) == 1:
+            return normalize(value[0])
+        return None
+
+    raw = response.text.lstrip("\ufeff").strip()
+    parsed = normalize(raw)
+    if parsed is not None:
+        return parsed
+
+    try:
+        return normalize(json.loads(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def probe_entity_set(
     session: requests.Session,
     api_base: str,
     verify_tls: bool,
     entity: dict[str, Any],
     *,
-    include_count: bool = False,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """Perform a minimal read-only collection probe for one entity set."""
+    """Count records visible to the user and retain a collection fallback for special entities."""
     entity_set = entity.get("entity_set_name")
     primary_id = entity.get("primary_id_attribute")
-    if not entity_set or not primary_id:
+    if not entity_set:
         return {
             "status": "NOT_PROBED",
             "http_status": None,
-            "reason": "EntitySetName or PrimaryIdAttribute is missing",
+            "reason": "EntitySetName is missing",
         }
 
-    url = f"{api_base}/{entity_set}?$select={primary_id}&$top=1"
+    count_url = f"{api_base}/{entity_set}/$count"
+    # Use the canonical Dataverse Web API headers. The scalar /$count response is
+    # still requested with Accept: application/json; successful servers return a
+    # plain integer body. Removing the OData headers, as v0.4.2 did, causes some
+    # Dynamics 365 on-premises deployments to reject every count request.
+    count_headers = {
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+        "If-None-Match": "null",
+    }
     try:
-        response = session.get(url, verify=verify_tls, timeout=timeout)
+        response = session.get(
+            count_url, headers=count_headers, verify=verify_tls, timeout=timeout
+        )
     except requests.exceptions.SSLError as exc:
         return {
             "status": "REQUEST_ERROR",
             "http_status": None,
+            "count_url": count_url,
             "error": f"TLS error: {exc}",
         }
     except requests.exceptions.RequestException as exc:
         return {
             "status": "REQUEST_ERROR",
             "http_status": None,
+            "count_url": count_url,
             "error": f"Request failed: {exc}",
         }
 
-    result: dict[str, Any] = {
-        "http_status": response.status_code,
-        "content_type": response.headers.get("Content-Type", ""),
-    }
+    result = _probe_status_from_response(response)
+    result["count_url"] = count_url
+    result["count_http_status"] = response.status_code
+    result["count_content_type"] = response.headers.get("Content-Type")
+    result["probe_method"] = "GET entity-set /$count"
 
-    if response.status_code == 401:
-        result.update(status="AUTHENTICATION_FAILED", error=compact_error(response))
-        return result
-    if response.status_code == 403:
-        result.update(status="ACCESS_DENIED", error=compact_error(response))
-        return result
-    if response.status_code == 404:
-        result.update(status="NOT_ADDRESSABLE", error=compact_error(response))
-        return result
-    if response.status_code == 400:
-        result.update(status="INVALID_OR_UNSUPPORTED", error=compact_error(response))
-        return result
-    if response.status_code == 429:
+    direct_count_error: str | None = None
+    if response.ok:
+        count = _parse_visible_count_response(response)
+        if count is not None:
+            result.update(
+                status="READABLE_WITH_DATA" if count > 0 else "READABLE_EMPTY_OR_FILTERED",
+                visible_record_count=count,
+                count_source="entity-set /$count",
+            )
+            if count == 0:
+                result["note"] = "The count endpoint returned 0; the table may be empty or security-filtered for this user."
+            return result
+        direct_count_error = (
+            "The /$count endpoint returned HTTP success but its body was not recognized as a non-negative integer: "
+            f"{response.text[:200]!r}"
+        )
+    else:
+        direct_count_error = result.get("error") or f"The /$count endpoint returned HTTP {response.status_code}."
+
+    # A number of Dynamics 365/on-premises entity sets reject the scalar path
+    # segment but support the OData query option. Request only one primary-key
+    # value while asking the service to include @odata.count. This remains a
+    # lightweight request and provides the same security-filtered visible count.
+    if not primary_id:
         result.update(
-            status="RATE_LIMITED",
-            error=compact_error(response),
-            retry_after=response.headers.get("Retry-After"),
+            status=result.get("status") or "INVALID_OR_UNSUPPORTED",
+            count_error=direct_count_error,
+            count_note="The /$count request failed and no PrimaryIdAttribute was available for a $count=true collection fallback.",
         )
         return result
-    if 500 <= response.status_code <= 599:
-        result.update(status="BACKEND_ERROR", error=compact_error(response))
-        return result
-    if not response.ok:
-        result.update(status="INVALID_OR_UNSUPPORTED", error=compact_error(response))
+
+    fallback_url = f"{api_base}/{entity_set}?$select={primary_id}&$top=1&$count=true"
+    result.pop("error", None)
+    result["count_endpoint_error"] = direct_count_error
+    result["fallback_url"] = fallback_url
+    try:
+        fallback = session.get(
+            fallback_url, headers=count_headers, verify=verify_tls, timeout=timeout
+        )
+    except requests.exceptions.RequestException as exc:
+        result.update(
+            count_error=direct_count_error,
+            fallback_error=f"Fallback collection count failed: {exc}",
+        )
         return result
 
-    content_type = result["content_type"].lower()
-    if "html" in content_type:
+    fallback_result = _probe_status_from_response(fallback)
+    if not fallback.ok:
         result.update(
-            status="AUTHENTICATION_FAILED",
-            error="Successful HTTP response returned HTML instead of OData JSON",
+            status=fallback_result.get("status", "INVALID_OR_UNSUPPORTED"),
+            count_error=direct_count_error,
+            fallback_http_status=fallback.status_code,
+            fallback_error=fallback_result.get("error"),
         )
         return result
 
     try:
-        payload = response.json()
+        payload = fallback.json()
     except ValueError:
-        result.update(status="NON_JSON_RESPONSE", error="Response was not valid JSON")
+        content_type = fallback.headers.get("Content-Type", "").lower()
+        looks_like_html = "html" in content_type or "<html" in fallback.text[:500].lower()
+        result.update(
+            status="AUTHENTICATION_FAILED" if looks_like_html else "NON_JSON_RESPONSE",
+            count_error=direct_count_error,
+            fallback_http_status=fallback.status_code,
+            fallback_error=(
+                "Fallback collection returned HTML instead of OData JSON"
+                if looks_like_html else "Fallback collection response was not valid JSON"
+            ),
+        )
         return result
 
     values = payload.get("value") if isinstance(payload, dict) else None
     if not isinstance(values, list):
         result.update(
             status="INVALID_OR_UNSUPPORTED",
-            error="Response did not contain an OData value array",
+            count_error=direct_count_error,
+            fallback_http_status=fallback.status_code,
+            fallback_error="Fallback collection response did not contain an OData value array",
         )
         return result
 
-    if include_count:
-        count_url = f"{api_base}/{entity_set}?$select={primary_id}&$top=1&$count=true"
-        count_payload, count_error, count_status = get_json(
-            session,
-            count_url,
-            verify_tls,
-            timeout=timeout,
-        )
-        if count_payload is not None and count_error is None:
-            count_value = count_payload.get("@odata.count")
-            if isinstance(count_value, int):
-                result["visible_record_count"] = count_value
-            elif isinstance(count_value, str) and count_value.isdigit():
-                result["visible_record_count"] = int(count_value)
-            else:
-                result["count_note"] = "The count query succeeded but did not return @odata.count."
-        else:
-            result["count_note"] = f"Count query unavailable (HTTP {count_status or 'n/a'}): {count_error or 'unknown error'}"
-
-    if not values:
-        result.update(
-            status="READABLE_EMPTY_OR_FILTERED",
-            visible_record_count_in_probe=0,
-            note="The table is callable, but it may be empty or security-filtered for this user.",
-        )
-        return result
-
-    first = values[0] if isinstance(values[0], dict) else {}
+    first = values[0] if values and isinstance(values[0], dict) else {}
     sample_id = first.get(primary_id) if isinstance(first, dict) else None
-    result.update(
-        status="READABLE_WITH_DATA",
-        visible_record_count_in_probe=len(values),
-        sample_record_id=normalize_guid(sample_id) if sample_id else None,
-    )
-    return result
+    fallback_count = _parse_visible_count_response(fallback)
+    if fallback_count is not None:
+        result.update(
+            status="READABLE_WITH_DATA" if fallback_count > 0 else "READABLE_EMPTY_OR_FILTERED",
+            fallback_http_status=fallback.status_code,
+            probe_method="GET entity-set /$count; GET collection with $count=true fallback",
+            visible_record_count=fallback_count,
+            count_source="collection @odata.count",
+            sample_record_id=normalize_guid(sample_id) if sample_id else None,
+        )
+        if fallback_count == 0:
+            result["note"] = "The collection count returned 0; the table may be empty or security-filtered for this user."
+        return result
 
+    result.update(
+        status="READABLE_WITH_DATA" if values else "READABLE_EMPTY_OR_FILTERED",
+        fallback_http_status=fallback.status_code,
+        probe_method="GET entity-set /$count; GET collection with $count=true fallback",
+        visible_record_count=None,
+        sample_record_id=normalize_guid(sample_id) if sample_id else None,
+        count_error=direct_count_error,
+        count_note="The entity collection is readable, but neither /$count nor @odata.count returned an exact value.",
+    )
+    if not values:
+        result["note"] = "The collection is callable, but it may be empty or security-filtered for this user."
+    return result
 
 def query_entity_access(
     session: requests.Session,
     api_base: str,
     verify_tls: bool,
     security: dict[str, Any],
-    *,
-    include_counts: bool = False,
 ) -> dict[str, Any]:
-    """Enumerate custom and sensitive standard entities and test minimal read access."""
+    """Enumerate all custom and default entities and test minimal read access."""
     attempts = [
         (CUSTOM_ENTITY_FIELDS, "rich"),
         (CUSTOM_ENTITY_FALLBACK_FIELDS, "compatibility"),
@@ -2284,46 +2385,51 @@ def query_entity_access(
             session,
             f"{api_base}/EntityDefinitions?$filter=IsCustomEntity eq true&$select={fields}",
             verify_tls,
-            timeout=90,
+            timeout=120,
         )
-        standard_records: list[dict[str, Any]] = []
-        standard_errors: list[dict[str, Any]] = []
-        for logical_name in SENSITIVE_STANDARD_ENTITY_LOGICAL_NAMES:
-            standard_candidate = query_collection(
-                session,
-                f"{api_base}/EntityDefinitions?$filter=LogicalName eq '{logical_name}'&$select={fields}",
-                verify_tls,
-                timeout=45,
-            )
-            if standard_candidate.get("status") == "success":
-                standard_records.extend(standard_candidate.get("records", []))
-            else:
-                standard_errors.append({
-                    "logical_name": logical_name,
-                    "http_status": standard_candidate.get("http_status"),
-                    "error": standard_candidate.get("error"),
-                })
+        default_candidate = query_collection(
+            session,
+            f"{api_base}/EntityDefinitions?$filter=IsCustomEntity eq false&$select={fields}",
+            verify_tls,
+            timeout=120,
+        )
 
-        if custom_candidate.get("status") == "success":
+        custom_ok = custom_candidate.get("status") == "success"
+        default_ok = default_candidate.get("status") == "success"
+
+        if custom_ok and default_ok:
             custom_records = custom_candidate.get("records", [])
+            default_records = default_candidate.get("records", [])
             for record in custom_records:
                 if isinstance(record, dict):
                     record["_enumeration_scope"] = "custom"
-            for record in standard_records:
+            for record in default_records:
                 if isinstance(record, dict):
                     record["_enumeration_scope"] = "sensitive_standard"
 
-            metadata_result = custom_candidate
-            metadata_result["records"] = custom_records + standard_records
-            metadata_result["sensitive_standard_errors"] = standard_errors
+            metadata_result = {
+                "status": "success",
+                "records": custom_records + default_records,
+                "record_count": len(custom_records) + len(default_records),
+                "page_count": int(custom_candidate.get("page_count", 0) or 0) + int(default_candidate.get("page_count", 0) or 0),
+                "custom_page_count": custom_candidate.get("page_count", 0),
+                "default_page_count": default_candidate.get("page_count", 0),
+            }
             selected_mode = mode
             break
         attempt_errors.append(
             {
                 "mode": mode,
-                "http_status": custom_candidate.get("http_status"),
-                "error": custom_candidate.get("error"),
-                "sensitive_standard_errors": standard_errors,
+                "custom": {
+                    "http_status": custom_candidate.get("http_status"),
+                    "error": custom_candidate.get("error"),
+                    "status": custom_candidate.get("status"),
+                },
+                "default": {
+                    "http_status": default_candidate.get("http_status"),
+                    "error": default_candidate.get("error"),
+                    "status": default_candidate.get("status"),
+                },
             }
         )
 
@@ -2356,7 +2462,7 @@ def query_entity_access(
     privilege_counts = {"held": 0, "not_held": 0, "unknown": 0}
     privilege_type_counts = {privilege_type: {"held": 0, "not_held": 0, "not_defined": 0} for privilege_type in ENTITY_PRIVILEGE_ORDER}
     for entity in entities:
-        probe = probe_entity_set(session, api_base, verify_tls, entity, include_count=include_counts)
+        probe = probe_entity_set(session, api_base, verify_tls, entity)
         entity["probe"] = probe
         status = str(probe.get("status") or "NOT_PROBED")
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -2388,20 +2494,24 @@ def query_entity_access(
         "metadata_mode": selected_mode,
         "metadata_attempts": attempt_errors,
         "metadata_page_count": metadata_result.get("page_count", 0),
+        "custom_metadata_page_count": metadata_result.get("custom_page_count", 0),
+        "default_metadata_page_count": metadata_result.get("default_page_count", 0),
         "entity_count": len(entities),
         "custom_entity_count": sum(1 for item in entities if item.get("scope") == "custom"),
+        "default_entity_count": sum(1 for item in entities if item.get("scope") == "sensitive_standard"),
         "sensitive_standard_entity_count": sum(1 for item in entities if item.get("scope") == "sensitive_standard"),
-        "sensitive_standard_requested": list(SENSITIVE_STANDARD_ENTITY_LOGICAL_NAMES),
-        "sensitive_standard_errors": metadata_result.get("sensitive_standard_errors", []),
-        "visible_record_counts_requested": include_counts,
+        "default_entities_mode": "all",
+        "sensitive_standard_requested": "all default entities",
+        "sensitive_standard_errors": [],
+        "visible_record_counts_requested": True,
         "probe_status_counts": status_counts,
         "read_privilege_counts": privilege_counts,
         "privilege_type_counts": privilege_type_counts,
         "entities": entities,
         "probe_method": {
-            "method": "GET collection with primary ID only and $top=1",
+            "method": "GET entity-set /$count; one-row collection fallback when /$count is unsupported",
             "read_only": True,
-            "empty_result_note": "READABLE_EMPTY_OR_FILTERED cannot distinguish an empty table from security-filtered rows.",
+            "empty_result_note": "A visible count of 0 cannot distinguish an empty table from security-filtered rows.",
         },
     }
 
@@ -2928,6 +3038,165 @@ def query_secret_candidate_records(
     return result
 
 
+
+PLUGIN_ASSEMBLY_SELECT = (
+    "pluginassemblyid,name,version,isolationmode,sourcetype,publickeytoken,"
+    "modifiedon,_modifiedby_value,customizationlevel,ismanaged,componentstate"
+)
+PLUGIN_ASSEMBLY_FILTER = (
+    "customizationlevel gt 0 "
+    "and publickeytoken ne '31bf3856ad364e35' "
+    "and not contains(name, 'Microsoft.')"
+)
+
+
+def find_entity_access_record(
+    entity_access: dict[str, Any],
+    logical_name: str,
+) -> dict[str, Any] | None:
+    """Find one normalized entity-access record by logical name."""
+    wanted = logical_name.lower()
+    for entity in entity_access.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
+        if str(entity.get("logical_name") or "").lower() == wanted:
+            return entity
+    return None
+
+
+def normalize_plugin_assembly(
+    record: dict[str, Any],
+    api_base: str,
+) -> dict[str, Any]:
+    """Normalize plug-in metadata without retaining the Base64 content field."""
+    assembly_id = normalize_guid(record.get("pluginassemblyid"))
+    metadata_url = (
+        f"{api_base}/pluginassemblies({assembly_id})?"
+        "$select=pluginassemblyid,name,version,isolationmode,sourcetype,"
+        "publickeytoken,modifiedon,_modifiedby_value,customizationlevel,ismanaged"
+        if assembly_id
+        else None
+    )
+    content_url = (
+        f"{api_base}/pluginassemblies({assembly_id})?"
+        "$select=pluginassemblyid,name,version,sourcetype,content"
+        if assembly_id
+        else None
+    )
+
+    source_type = record.get("sourcetype")
+    isolation_mode = record.get("isolationmode")
+    return {
+        "pluginassembly_id": assembly_id,
+        "name": record.get("name"),
+        "version": record.get("version"),
+        "source_type": source_type,
+        "source_type_label": {0: "Database", 1: "Disk", 2: "GAC"}.get(source_type, "Unknown"),
+        "isolation_mode": isolation_mode,
+        "isolation_mode_label": {1: "None", 2: "Sandbox"}.get(isolation_mode, "Unknown"),
+        "public_key_token": record.get("publickeytoken"),
+        "modified_on": record.get("modifiedon"),
+        "modified_by_id": normalize_guid(record.get("_modifiedby_value")),
+        "customization_level": record.get("customizationlevel"),
+        "is_managed": record.get("ismanaged"),
+        "component_state": record.get("componentstate"),
+        "database_content_expected": source_type == 0,
+        "metadata_url": metadata_url,
+        "content_fetch_url": content_url,
+    }
+
+
+def query_plugin_assemblies(
+    session: requests.Session,
+    api_base: str,
+    verify_tls: bool,
+    entity_access: dict[str, Any],
+) -> dict[str, Any]:
+    """Enumerate likely non-Microsoft/customized plug-in assemblies.
+
+    The content column is deliberately excluded. Binary retrieval is lazy and
+    available only from a live localhost dashboard session.
+    """
+    access_record = find_entity_access_record(entity_access, "pluginassembly")
+    read_privilege = (
+        access_record.get("read_privilege")
+        if isinstance(access_record, dict)
+        else None
+    )
+    probe = access_record.get("probe") if isinstance(access_record, dict) else None
+
+    if (
+        isinstance(read_privilege, dict)
+        and read_privilege.get("held") is False
+        and isinstance(probe, dict)
+        and probe.get("status") == "ACCESS_DENIED"
+    ):
+        return {
+            "status": "skipped",
+            "reason": "The pluginassembly table is not readable by the authenticated user.",
+            "assembly_count": 0,
+            "assemblies": [],
+            "content_in_json": False,
+            "filter": PLUGIN_ASSEMBLY_FILTER,
+            "entity_access": {
+                "read_privilege": read_privilege,
+                "probe": probe,
+            },
+        }
+
+    query = urlencode(
+        {
+            "$select": PLUGIN_ASSEMBLY_SELECT,
+            "$filter": PLUGIN_ASSEMBLY_FILTER,
+            "$orderby": "name asc",
+        }
+    )
+    endpoint = f"{api_base}/pluginassemblies?{query}"
+    response = query_collection(session, endpoint, verify_tls, timeout=90)
+
+    if response.get("status") != "success":
+        return {
+            "status": response.get("status", "error"),
+            "http_status": response.get("http_status"),
+            "error": response.get("error"),
+            "assembly_count": 0,
+            "assemblies": [],
+            "content_in_json": False,
+            "filter": PLUGIN_ASSEMBLY_FILTER,
+            "enumeration_url": endpoint,
+            "entity_access": {
+                "read_privilege": read_privilege,
+                "probe": probe,
+            },
+        }
+
+    assemblies = [
+        normalize_plugin_assembly(record, api_base)
+        for record in response.get("records", [])
+        if isinstance(record, dict)
+    ]
+    assemblies.sort(key=lambda item: str(item.get("name") or "").lower())
+
+    return {
+        "status": "success",
+        "assembly_count": len(assemblies),
+        "page_count": response.get("page_count", 0),
+        "assemblies": assemblies,
+        "content_in_json": False,
+        "content_retrieval": "lazy_dashboard_only",
+        "filter": PLUGIN_ASSEMBLY_FILTER,
+        "filter_note": (
+            "Heuristic selection of customized/non-Microsoft assemblies. "
+            "Third-party assemblies may be included and client assemblies in unusual naming/signing schemes may be missed."
+        ),
+        "enumeration_url": endpoint,
+        "entity_access": {
+            "read_privilege": read_privilege,
+            "probe": probe,
+        },
+    }
+
+
 def query_secret_configuration_scan(
     session: requests.Session,
     api_base: str,
@@ -3399,6 +3668,13 @@ def print_summary(results: dict[str, Any], output_path: Path) -> None:
     custom_entities = results.get("entity_access", results.get("custom_entities", {}))
     if isinstance(custom_entities, dict):
         print_entity_access(custom_entities)
+    plugins = results.get("plugin_assemblies", {})
+    if isinstance(plugins, dict):
+        print("\nPlug-in assemblies")
+        print("------------------")
+        print(f"Status            : {plugins.get('status', 'unknown')}")
+        print(f"Likely custom     : {plugins.get('assembly_count', 0)}")
+        print(f"Content in JSON   : {plugins.get('content_in_json', False)}")
     secret_scan = results.get("secret_scan", {})
     if isinstance(secret_scan, dict):
         print("\nSecrets and configuration")
@@ -3432,7 +3708,7 @@ def print_compact_summary(results: dict[str, Any], output_path: Path) -> None:
     print(f"Held privileges     : {inventory_summary.get('held_count', 0)}")
     print(f"Direct roles        : {security.get('direct_roles', {}).get('role_count', 0) if isinstance(security, dict) else 0}")
     print(f"Inherited roles     : {security.get('owner_team_roles', {}).get('inherited_role_count', 0) if isinstance(security, dict) else 0}")
-    print(f"Default entities    : {entity_access.get('sensitive_standard_entity_count', 0) if isinstance(entity_access, dict) else 0}")
+    print(f"Default entities    : {entity_access.get('default_entity_count', entity_access.get('sensitive_standard_entity_count', 0)) if isinstance(entity_access, dict) else 0}")
     print(f"Custom entities     : {entity_access.get('custom_entity_count', 0) if isinstance(entity_access, dict) else 0}")
     print(f"Readable with data  : {counts.get('READABLE_WITH_DATA', 0)}")
     print(f"No visible data     : {counts.get('READABLE_EMPTY_OR_FILTERED', 0)}")
@@ -3440,7 +3716,14 @@ def print_compact_summary(results: dict[str, Any], output_path: Path) -> None:
     print(f"Potential insecure  : {len(organization.get('security_signals', [])) if isinstance(organization, dict) else 0}")
     secret_scan = results.get("secret_scan", {})
     print(f"Secret/config flags : {secret_scan.get('finding_count', 0) if isinstance(secret_scan, dict) else 0}")
+    plugins = results.get("plugin_assemblies", {})
+    print(f"Plug-in assemblies  : {plugins.get('assembly_count', 0) if isinstance(plugins, dict) else 0}")
     print(f"\nResults saved to   : {output_path}")
+
+def print_progress(step: int, total: int, message: str) -> None:
+    """Print a simple flushed progress indicator for long enumeration stages."""
+    print(f"[{step}/{total}] {message}", flush=True)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -3471,11 +3754,6 @@ def main() -> None:
         "--verbose",
         action="store_true",
         help="Print the full CLI output instead of the compact summary",
-    )
-    parser.add_argument(
-        "--entity-counts",
-        action="store_true",
-        help="Request @odata.count for each entity probe (slower; counts only records visible to this user)",
     )
     parser.add_argument(
         "--no-secret-scan",
@@ -3510,6 +3788,9 @@ def main() -> None:
     cookies = capture_browser_session(base_url, args.verify)
     session = build_session(cookies)
 
+    print("\nAuthentication captured. Enumeration is running...", flush=True)
+    total_steps = 7
+    print_progress(1, total_steps, "Detecting the Web API and current identity...")
     api_detection = detect_api_endpoint(
         session,
         base_url,
@@ -3519,6 +3800,7 @@ def main() -> None:
     api_base = api_detection["api_base"]
     api_version = api_detection["api_version"]
     identity = api_detection["identity"]
+    print_progress(2, total_steps, "Reading version and organization settings...")
     version_result = query_version(session, api_base, args.verify)
     organization_result = query_organization(
         session,
@@ -3526,19 +3808,28 @@ def main() -> None:
         args.verify,
         identity["OrganizationId"],
     )
+    print_progress(3, total_steps, "Enumerating roles and effective privileges...")
     security_result = query_security_roles_and_privileges(
         session,
         api_base,
         args.verify,
         identity["UserId"],
     )
+    print_progress(4, total_steps, "Enumerating entities and counting visible records...")
     entity_access_result = query_entity_access(
         session,
         api_base,
         args.verify,
         security_result,
-        include_counts=args.entity_counts,
     )
+    print_progress(5, total_steps, "Enumerating plug-in assemblies...")
+    plugin_assemblies_result = query_plugin_assemblies(
+        session,
+        api_base,
+        args.verify,
+        entity_access_result,
+    )
+    print_progress(6, total_steps, "Scanning readable configuration and secret-like fields...")
     if args.no_secret_scan:
         secret_scan_result: dict[str, Any] = {
             "status": "disabled",
@@ -3555,6 +3846,7 @@ def main() -> None:
             record_limit=args.secret_scan_limit,
         )
 
+    print_progress(7, total_steps, "Preparing output and dashboard data...")
     results: dict[str, Any] = {
         "target": {
             "display_url": base_url,
@@ -3571,6 +3863,7 @@ def main() -> None:
         "security": security_result,
         "entity_access": entity_access_result,
         "custom_entities": entity_access_result,
+        "plugin_assemblies": plugin_assemblies_result,
         "secret_scan": secret_scan_result,
     }
 
@@ -3590,7 +3883,14 @@ def main() -> None:
                 "Dashboard module not found. Keep d365_dashboard.py in the same "
                 f"directory as this script. ({exc})"
             )
-        serve_dashboard(args.output, port=args.dashboard_port, open_browser=True)
+        serve_dashboard(
+            args.output,
+            port=args.dashboard_port,
+            open_browser=True,
+            live_session=session,
+            api_base=api_base,
+            verify_tls=args.verify,
+        )
 
 
 if __name__ == "__main__":
